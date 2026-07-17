@@ -23,6 +23,39 @@ const formatDisplayDate = (dbDateStr) => {
   return String(dbDateStr).substring(0, 10);
 };
 
+const missingAadhaarSuffix = "000000000000";
+const digitsOnly = (value) => String(value ?? "").replace(/\D/g, "");
+
+const generateRandom12DigitSuffix = () => {
+  let suffix = "";
+  do {
+    if (globalThis.crypto?.getRandomValues) {
+      const values = new Uint8Array(12);
+      globalThis.crypto.getRandomValues(values);
+      suffix = Array.from(values, (value) => String(value % 10)).join("");
+    } else {
+      suffix = Array.from({ length: 12 }, () =>
+        String(Math.floor(Math.random() * 10)),
+      ).join("");
+    }
+  } while (suffix === missingAadhaarSuffix);
+  return suffix;
+};
+
+const getApprovalRegNoSuffix = (member) => {
+  const storedRegNo = digitsOnly(member.AsthaMaRegNo);
+  if (storedRegNo.length >= 16 && !storedRegNo.endsWith(missingAadhaarSuffix)) {
+    return storedRegNo.slice(4);
+  }
+
+  const aadhaarNo = digitsOnly(member.AsthaMaAadharNo);
+  if (aadhaarNo.length === 12 && aadhaarNo !== missingAadhaarSuffix) {
+    return aadhaarNo;
+  }
+
+  return generateRandom12DigitSuffix();
+};
+
 const AsthaMaaModal = ({ member, mode, onClose, onSuccess }) => {
   const isView = mode === "view";
   const cleanInitialImage =
@@ -999,8 +1032,12 @@ const AsthaMaaTable = ({ refreshTrigger, externalFilters }) => {
         );
       }
 
-      const aadhar = member.AsthaMaAadharNo || "000000000000";
-      const finalApprovalId = `${stateId}${distId}${aadhar}`;
+      const storedRegNo = digitsOnly(member.AsthaMaRegNo);
+      const finalApprovalId =
+        storedRegNo.length >= 16 &&
+        !storedRegNo.endsWith(missingAadhaarSuffix)
+          ? storedRegNo
+          : `${stateId}${distId}${getApprovalRegNoSuffix(member)}`;
 
       setApprovalData({ id: finalApprovalId, dbDate });
     }
@@ -1086,7 +1123,9 @@ const AsthaMaaTable = ({ refreshTrigger, externalFilters }) => {
       );
       toast.dismiss("approve");
       if (res.ok) {
-        toast.success(`Astha Maa Approved! ID: ${approvalData.id}`);
+        const result = await res.json().catch(() => ({}));
+        const approvedRegNo = result.AsthaMaRegNo || approvalData.id;
+        toast.success(`Astha Maa Approved! ID: ${approvedRegNo}`);
         closeModal();
         fetchMembers();
       } else {

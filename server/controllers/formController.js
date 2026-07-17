@@ -1,4 +1,5 @@
 const db = require("../config/db");
+const crypto = require("crypto");
 const { saveBase64File } = require("../utils/fileUploadHelper");
 
 const nullableId = (value) => {
@@ -7,6 +8,143 @@ const nullableId = (value) => {
 };
 
 const isInactive = (value) => String(value) === "0";
+const missingAadhaarSuffix = "000000000000";
+const asthaMaaRegNoAttemptLimit = 25;
+
+const digitsOnly = (value) => String(value ?? "").replace(/\D/g, "");
+
+const hasUsableAadhaar = (value) => {
+  const digits = digitsOnly(value);
+  return digits.length === 12 && digits !== missingAadhaarSuffix;
+};
+
+const generateRandom12DigitSuffix = () => {
+  let suffix = "";
+  do {
+    suffix = Array.from({ length: 12 }, () =>
+      String(crypto.randomInt(0, 10)),
+    ).join("");
+  } while (suffix === missingAadhaarSuffix);
+  return suffix;
+};
+
+const checkAsthaMaaRegNoExists = (regNo, currentId, callback) => {
+  let query = "SELECT AsthaMaRegId FROM asthama_reg WHERE AsthaMaRegNo = ?";
+  const params = [regNo];
+  const currentProfileId = nullableId(currentId);
+  if (currentProfileId) {
+    query += " AND AsthaMaRegId != ?";
+    params.push(currentProfileId);
+  }
+  query += " LIMIT 1";
+
+  db.query(query, params, (err, rows) => {
+    if (err) return callback(err);
+    callback(null, rows.length > 0);
+  });
+};
+
+const buildUniqueAsthaMaaRegNo = (
+  prefix,
+  currentId,
+  callback,
+  attempt = 0,
+) => {
+  if (attempt >= asthaMaaRegNoAttemptLimit) {
+    return callback(
+      new Error("Unable to generate a unique Astha Maa registration number."),
+    );
+  }
+
+  const candidate = `${prefix}${generateRandom12DigitSuffix()}`;
+  checkAsthaMaaRegNoExists(candidate, currentId, (err, exists) => {
+    if (err) return callback(err);
+    if (!exists) return callback(null, candidate);
+    buildUniqueAsthaMaaRegNo(prefix, currentId, callback, attempt + 1);
+  });
+};
+
+const resolveAsthaMaaRegNoPrefix = (data, existingRegNoDigits, callback) => {
+  const existingPrefix =
+    existingRegNoDigits.length >= 4 ? existingRegNoDigits.slice(0, 4) : "";
+  if (existingPrefix && existingPrefix !== "0000") {
+    return callback(null, existingPrefix);
+  }
+
+  const stateName = String(data.AsthaMaStateName || "").trim();
+  const districtName = String(data.AsthaMaDistName || "").trim();
+  if (!stateName || !districtName) {
+    return callback(null, existingPrefix || "0000");
+  }
+
+  const query = `
+    SELECT
+      LPAD(COALESCE(s.StateId, 0), 2, '0') AS StatePart,
+      LPAD(COALESCE(d.DistId, 0), 2, '0') AS DistPart
+    FROM (SELECT 1) seed
+    LEFT JOIN state s
+      ON LOWER(TRIM(s.StateName)) = LOWER(TRIM(?))
+    LEFT JOIN dist d
+      ON LOWER(TRIM(d.DistName)) = LOWER(TRIM(?))
+      AND (s.StateId IS NULL OR d.StateId = s.StateId)
+    LIMIT 1
+  `;
+
+  db.query(query, [stateName, districtName], (err, rows) => {
+    if (err) return callback(err);
+    const row = rows[0] || {};
+    callback(null, `${row.StatePart || "00"}${row.DistPart || "00"}`);
+  });
+};
+
+const resolveAsthaMaaRegNoForSave = (data, currentId, callback) => {
+  const existingRegNoDigits = digitsOnly(data.AsthaMaRegNo);
+  if (isInactive(data.AsthaMaIsActive)) {
+    return callback(null, existingRegNoDigits || data.AsthaMaRegNo || null);
+  }
+
+  const hasExistingRegNo =
+    existingRegNoDigits.length >= 16 &&
+    !existingRegNoDigits.endsWith(missingAadhaarSuffix);
+
+  if (hasExistingRegNo) {
+    return checkAsthaMaaRegNoExists(
+      existingRegNoDigits,
+      currentId,
+      (err, exists) => {
+        if (err) return callback(err);
+        if (!exists) return callback(null, existingRegNoDigits);
+        resolveAsthaMaaRegNoPrefix(
+          data,
+          existingRegNoDigits,
+          (prefixErr, prefix) => {
+            if (prefixErr) return callback(prefixErr);
+            buildUniqueAsthaMaaRegNo(prefix, currentId, callback);
+          },
+        );
+      },
+    );
+  }
+
+  resolveAsthaMaaRegNoPrefix(data, existingRegNoDigits, (prefixErr, prefix) => {
+    if (prefixErr) return callback(prefixErr);
+
+    if (hasUsableAadhaar(data.AsthaMaAadharNo)) {
+      const aadhaarCandidate = `${prefix}${digitsOnly(data.AsthaMaAadharNo)}`;
+      return checkAsthaMaaRegNoExists(
+        aadhaarCandidate,
+        currentId,
+        (err, exists) => {
+          if (err) return callback(err);
+          if (!exists) return callback(null, aadhaarCandidate);
+          buildUniqueAsthaMaaRegNo(prefix, currentId, callback);
+        },
+      );
+    }
+
+    buildUniqueAsthaMaaRegNo(prefix, currentId, callback);
+  });
+};
 
 const signupRoles = {
   SN: "State Super Administrator",
@@ -860,7 +998,9 @@ exports.createAsthaMaa = (req, res) => {
         return res.status(500).json({ error: resolveErr.message });
       const resolvedStateNGORegId =
         data.StateNGORegId || resolveResults[0]?.StateNGORegId || null;
-      const insertQuery = `INSERT INTO asthama_reg (AsthaMaUserName, AsthaMaGuardianName, AsthaMaDOB, AsthaMaGuardianContactNo, AsthaMaStateName, AsthaMaDistName, AsthaMaCity, AsthaMaBlockName, AsthaMaPO, AsthaMaPS, AsthaMaGramPanchayet, AsthaMaVillage, AsthaMaPincode, AsthaMaContactNo, AsthaMaMailId, AsthaMaBankName, AsthaMaBranchName, AsthaMaBankAcctNo, AsthaMaIFSCode, AsthaMaPanNo, AsthaMaAadharNo, AsthaMaJoiningAmt, AsthaMaWalletBalance, AsthaMaSignupUserName, AsthaMaSignupEmail, AsthaMaSignupPassword, AsthaMaCreatedByAuthRegId, AsthaMaCreatedDate, StateNGORegId, DistNGORegId, SupRegId, AsthaDidiRegId, AsthaMaIsActive, AcctHead) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),?,?,?,?,?,?)`;
+      resolveAsthaMaaRegNoForSave(data, null, (regNoErr, asthaMaRegNo) => {
+        if (regNoErr) return res.status(500).json({ error: regNoErr.message });
+        const insertQuery = `INSERT INTO asthama_reg (AsthaMaUserName, AsthaMaGuardianName, AsthaMaDOB, AsthaMaGuardianContactNo, AsthaMaStateName, AsthaMaDistName, AsthaMaCity, AsthaMaBlockName, AsthaMaPO, AsthaMaPS, AsthaMaGramPanchayet, AsthaMaVillage, AsthaMaPincode, AsthaMaContactNo, AsthaMaMailId, AsthaMaBankName, AsthaMaBranchName, AsthaMaBankAcctNo, AsthaMaIFSCode, AsthaMaPanNo, AsthaMaAadharNo, AsthaMaRegNo, AsthaMaJoiningAmt, AsthaMaWalletBalance, AsthaMaSignupUserName, AsthaMaSignupEmail, AsthaMaSignupPassword, AsthaMaCreatedByAuthRegId, AsthaMaCreatedDate, StateNGORegId, DistNGORegId, SupRegId, AsthaDidiRegId, AsthaMaIsActive, AcctHead) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),?,?,?,?,?,?)`;
       const values = [
         data.AsthaMaUserName,
         data.AsthaMaGuardianName,
@@ -883,6 +1023,7 @@ exports.createAsthaMaa = (req, res) => {
         data.AsthaMaIFSCode,
         data.AsthaMaPanNo,
         data.AsthaMaAadharNo,
+        asthaMaRegNo,
         data.AsthaMaJoiningAmt,
         data.AsthaMaWalletBalance,
         data.AsthaMaSignupUserName,
@@ -939,9 +1080,14 @@ exports.createAsthaMaa = (req, res) => {
           (syncErr) => {
             if (syncErr)
               return res.status(500).json({ error: syncErr.message });
-            res.json({ message: "Astha Maa added successfully", id: newId });
+            res.json({
+              message: "Astha Maa added successfully",
+              id: newId,
+              AsthaMaRegNo: asthaMaRegNo,
+            });
           },
         );
+      });
       });
     },
   );
@@ -958,7 +1104,9 @@ exports.updateAsthaMaa = (req, res) => {
   );
   const stateNgoRegId =
     data.StateNGORegId || data.ResolvedStateNGORegId || null;
-  const query = `UPDATE asthama_reg SET AsthaMaProfileImage=?, AsthaMaUserName=?, AsthaMaGuardianName=?, AsthaMaDOB=?, AsthaMaGuardianContactNo=?, AsthaMaStateName=?, AsthaMaDistName=?, AsthaMaCity=?, AsthaMaBlockName=?, AsthaMaPO=?, AsthaMaPS=?, AsthaMaGramPanchayet=?, AsthaMaVillage=?, AsthaMaPincode=?, AsthaMaContactNo=?, AsthaMaMailId=?, AsthaMaBankName=?, AsthaMaBranchName=?, AsthaMaBankAcctNo=?, AsthaMaIFSCode=?, AsthaMaPanNo=?, AsthaMaAadharNo=?, AsthaMaJoiningAmt=?, AsthaMaWalletBalance=?, AsthaMaSignupUserName=?, AsthaMaSignupEmail=?, AsthaMaSignupPassword=?, StateNGORegId=?, DistNGORegId=?, SupRegId=?, AsthaDidiRegId=?, AsthaMaIsActive=?, AsthaMaAprovedBy=?, AsthaMaAprovalDate=?, AsthaMaRegNo=?, AcctHead=? WHERE AsthaMaRegId=?`;
+  resolveAsthaMaaRegNoForSave(data, id, (regNoErr, asthaMaRegNo) => {
+    if (regNoErr) return res.status(500).json({ error: regNoErr.message });
+    const query = `UPDATE asthama_reg SET AsthaMaProfileImage=?, AsthaMaUserName=?, AsthaMaGuardianName=?, AsthaMaDOB=?, AsthaMaGuardianContactNo=?, AsthaMaStateName=?, AsthaMaDistName=?, AsthaMaCity=?, AsthaMaBlockName=?, AsthaMaPO=?, AsthaMaPS=?, AsthaMaGramPanchayet=?, AsthaMaVillage=?, AsthaMaPincode=?, AsthaMaContactNo=?, AsthaMaMailId=?, AsthaMaBankName=?, AsthaMaBranchName=?, AsthaMaBankAcctNo=?, AsthaMaIFSCode=?, AsthaMaPanNo=?, AsthaMaAadharNo=?, AsthaMaJoiningAmt=?, AsthaMaWalletBalance=?, AsthaMaSignupUserName=?, AsthaMaSignupEmail=?, AsthaMaSignupPassword=?, StateNGORegId=?, DistNGORegId=?, SupRegId=?, AsthaDidiRegId=?, AsthaMaIsActive=?, AsthaMaAprovedBy=?, AsthaMaAprovalDate=?, AsthaMaRegNo=?, AcctHead=? WHERE AsthaMaRegId=?`;
   const values = [
     fileName,
     data.AsthaMaUserName,
@@ -994,7 +1142,7 @@ exports.updateAsthaMaa = (req, res) => {
     data.AsthaMaIsActive,
     data.AsthaMaAprovedBy,
     data.AsthaMaAprovalDate,
-    data.AsthaMaRegNo,
+    asthaMaRegNo,
     data.AcctHead || "AM",
     id,
   ];
@@ -1029,13 +1177,17 @@ exports.updateAsthaMaa = (req, res) => {
               (syncErr) => {
                 if (syncErr)
                   return res.status(500).json({ error: syncErr.message });
-                res.json({ message: "Record updated successfully" });
+                res.json({
+                  message: "Record updated successfully",
+                  AsthaMaRegNo: asthaMaRegNo,
+                });
               },
             );
           },
         );
       },
     );
+  });
   });
 };
 
